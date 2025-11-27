@@ -9,4 +9,6 @@ Rational
 
 Use
 - The studied ratio can be referenced in studying liquidity level - whether Abundant, ample, Scarace
-- Statistically meaningful negative correlation between the studeid ratio and stock market volatility
+- Statistically meaningful negative correlation between the studeid ratio and stock market volatility 
+/// If ration goes below certain level, we can assume that stock market will be more volatile to the news that it responded little to none.
+
