@@ -8,6 +8,8 @@ Liquidity Score = Change in the Fed policy rate + Change in the Fed balance shee
 This model places emphasis on the Fed’s long-term bond purchase activity, as I believe that buying long-term Treasuries is significantly more effective than buying short-term Treasuries in easing financial conditions.
 Because this model uses a universal sigma, it is not appropriate for identifying short-term policy actions by the Fed. (Model will probably underestimate the size of the operation as 2008 and post covide effort were great)
 
+This modle can be used quite effectively when used with...
+
 Chicago Fed National Financial Conditions Index / Highly recommend
 https://fred.stlouisfed.org/series/NFCI
 
@@ -17,5 +19,5 @@ https://github.com/Antonio3708/Macro-Variables/tree/main/Total%20reserves%20at%2
 Fed balance sheet asset composition (Go to treasury securities tab)
 https://www.newyorkfed.org/data-and-statistics/data-visualization/system-open-market-account-portfolio#:~:text=Overview,Open%20Market%20Account%20(SOMA).
 
-This modle can be used quite effectively
+
 
