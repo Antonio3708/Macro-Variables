@@ -1,0 +1,294 @@
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker 
+
+# --- 1. CONFIGURATION ---
+
+# **REPLACE WITH YOUR ACTUAL FRED API KEY**
+FRED_API_KEY = "" 
+
+# --- MODEL PERIODS ---
+# This defines the data used to calculate the CONSTANT Standard Deviation (sigma)
+UNIVERSAL_START_DATE = '1993-01-01' 
+# This defines the period you want to DISPLAY/PLOT
+PLOT_START_DATE = '2020-01-01' 
+PLOT_END_DATE = '2025-12-31' 
+
+# FRED Series IDs
+FRED_SERIES = {
+    'DFF': 'DFF',        # Federal Funds Effective Rate (Daily)
+    'WALCL': 'WALCL',    # Total Assets (Weekly - Millions of USD)
+    'TREAS10Y': 'TREAS10Y', # 10Y+ Treasury Securities (Weekly - Millions of USD)
+    'TREAS1T5': 'TREAS1T5', # 1Y to 5Y Treasury Securities (Weekly - Millions of USD)
+    'SP500': 'SP500'       # S&P 500 Index Level
+}
+
+# Formula Weights (Conceptual Model)
+WEIGHTS = {
+    'R': -3.0,       # Federal Funds Rate (Rate Hike = Contraction)
+    'BS_Size': 2.0,  # Balance Sheet Size (Expansion = Expansion)
+    'BS_Duration': 1.0 # Duration Shift (Longer Duration = Expansion)
+}
+
+# Mapping regimes to colors for plotting (HIGH-CONTRAST COLORS)
+REGIME_COLORS = {
+    "Aggressive Expansion": '#008000',
+    "Moderate Expansion": '#7CFC00',
+    "Neutral": '#D3D3D3',
+    "Moderate Contraction": '#FFA500',
+    "Aggressive Contraction": '#DC143C'
+}
+
+# Factor used to define the Neutral Zone (e.g., 0.05 = 5% of sigma)
+NEUTRAL_EPSILON_FACTOR = 0.05 
+
+# --- 2. DATA FETCHING AND PROCESSING ---
+
+def fetch_fred_data(series_id, api_key, start_date, end_date):
+    """Fetches data for a single FRED series, using both start and end dates."""
+    if not api_key:
+        raise ValueError("Please provide a FRED API key.")
+        
+    url = f"https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        'series_id': series_id,
+        'api_key': api_key,
+        'file_type': 'json',
+        'observation_start': start_date,
+        'observation_end': end_date,
+        'sort_order': 'asc'
+    }
+    response = requests.get(url, params=params)
+    response.raise_for_status() 
+    
+    data = response.json().get('observations', [])
+    
+    df = pd.DataFrame(data)[['date', 'value']]
+    df['value'] = pd.to_numeric(df['value'], errors='coerce') 
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date').dropna()
+    return df
+
+def process_data(api_key, start_date, end_date, series_config):
+    """Fetches all data, aggregates to monthly (Month End - ME), and combines."""
+    
+    print(f"Fetching FRED data from {start_date} to {end_date}...")
+    
+    data = {}
+    for key, series_id in series_config.items():
+        df = fetch_fred_data(series_id, api_key, start_date, end_date) 
+        
+        # DFF uses mean, others (WALCL, TREAS, SP500) use the last value of the month
+        if key in ['DFF']:
+            data[key] = df['value'].resample('ME').mean()
+        else:
+            data[key] = df['value'].resample('ME').last() 
+            
+    df_combined = pd.DataFrame(data).dropna()
+    print(f"Data fetched successfully. Model Start Date: {df_combined.index.min().strftime('%Y-%m-%d')}")
+    return df_combined
+
+# --- 3. MODEL CALCULATION ---
+
+def calculate_liquidity_score(df, weights):
+    """Calculates all components, normalizes, and computes Delta L, and tracks components."""
+    
+    # 1. Calculate Changes (Delta)
+    df_delta = pd.DataFrame(index=df.index)
+    df_delta['dDFF'] = df['DFF'].diff()
+    df_delta['dWALCL'] = df['WALCL'].diff()
+    
+    df_delta['BS_Ratio'] = df['TREAS10Y'] / df['TREAS1T5']
+    df_delta['dBS_Duration'] = df_delta['BS_Ratio'].diff()
+    df_delta = df_delta.dropna()
+
+    # Calculate unnormalized components (Weighted Delta)
+    df_norm = pd.DataFrame(index=df_delta.index)
+    df_norm['Comp_R_Unnorm'] = weights['R'] * df_delta['dDFF']
+    df_norm['Comp_BS_Size_Unnorm'] = weights['BS_Size'] * df_delta['dWALCL']
+    df_norm['Comp_BS_Duration_Unnorm'] = weights['BS_Duration'] * df_delta['dBS_Duration']
+
+    # Unnormalized Delta L Score
+    df_norm['Delta_L_Unnorm'] = (df_norm['Comp_R_Unnorm'] + 
+                                 df_norm['Comp_BS_Size_Unnorm'] + 
+                                 df_norm['Comp_BS_Duration_Unnorm'])
+    
+    # Also add the raw delta series for the next step's standardization
+    for col in ['dDFF', 'dWALCL', 'dBS_Duration']:
+        df_norm[col] = df_delta[col]
+    
+    return df_norm
+
+# --- 4. REGIME CLASSIFICATION & DRIVER IDENTIFICATION ---
+
+def classify_regimes_with_constant_sigma(df_norm, sigma_DL, epsilon_DL):
+    """Classifies the Delta L score using a constant, externally provided sigma."""
+    
+    def get_regime(score):
+        if score > sigma_DL:
+            return "Aggressive Expansion"
+        elif score > epsilon_DL: 
+            return "Moderate Expansion"
+        elif score >= -epsilon_DL: 
+            return "Neutral"
+        elif score > -sigma_DL: 
+            return "Moderate Contraction"
+        else:
+            return "Aggressive Contraction"
+
+    df_norm['Regime'] = df_norm['Delta_L'].apply(get_regime)
+    return df_norm
+
+def identify_dominant_driver(df_norm):
+    """Identifies the component (R, S, or D) that contributed the largest absolute value to Delta_L."""
+    
+    # Use the normalized (Comp) columns for driver identification
+    df_abs_contributions = df_norm[['Comp_R', 'Comp_BS_Size', 'Comp_BS_Duration']].abs()
+    dominant_cols = df_abs_contributions.idxmax(axis=1)
+    
+    driver_map = {
+        'Comp_R': 'R',
+        'Comp_BS_Size': 'S',
+        'Comp_BS_Duration': 'D'
+    }
+    
+    df_norm['Driver'] = dominant_cols.map(driver_map)
+    return df_norm
+
+# --- 5. EXECUTION AND VISUALIZATION (Updated for Subplots and Fixed Layout) ---
+
+if __name__ == '__main__':
+    
+    try:
+        # 1. CALCULATE UNIVERSAL SIGMA (1993-Present)
+        print("--- Step 1: Calculating Universal Sigma (1993-Present) ---")
+        df_raw_universal = process_data(FRED_API_KEY, UNIVERSAL_START_DATE, PLOT_END_DATE, FRED_SERIES)
+        df_model_universal = calculate_liquidity_score(df_raw_universal, WEIGHTS)
+        
+        # Calculate STD DEV for each raw delta component
+        stds = {}
+        for col in ['dDFF', 'dWALCL', 'dBS_Duration']:
+            stds[col] = df_model_universal[col].std()
+        
+        # Normalize the universal model components (Z-score)
+        df_model_universal['Comp_R'] = WEIGHTS['R'] * (df_model_universal['dDFF'] / stds['dDFF'])
+        df_model_universal['Comp_BS_Size'] = WEIGHTS['BS_Size'] * (df_model_universal['dWALCL'] / stds['dWALCL'])
+        df_model_universal['Comp_BS_Duration'] = WEIGHTS['BS_Duration'] * (df_model_universal['dBS_Duration'] / stds['dBS_Duration'])
+        
+        # Calculate the final Delta_L for the whole period
+        df_model_universal['Delta_L'] = (df_model_universal['Comp_R'] + 
+                                         df_model_universal['Comp_BS_Size'] + 
+                                         df_model_universal['Comp_BS_Duration'])
+        
+        # Calculate the Universal Thresholds
+        sigma_DL_universal = df_model_universal['Delta_L'].std()
+        epsilon_DL_universal = NEUTRAL_EPSILON_FACTOR * sigma_DL_universal
+        
+        print(f"Universal Sigma Calculated: {sigma_DL_universal:.2f}")
+        
+        # 2. FILTER AND CLASSIFY (Using the PLOT_START_DATE)
+        print("\n--- Step 2: Filtering and Classifying for Plot Period ---")
+        
+        # Filter the universal DataFrame for the desired plot start date
+        df_plot_final = df_model_universal[df_model_universal.index >= PLOT_START_DATE].copy()
+        
+        # Apply the universal sigma for classification
+        df_plot_final = classify_regimes_with_constant_sigma(
+            df_plot_final, 
+            sigma_DL_universal, 
+            epsilon_DL_universal
+        )
+        
+        # Identify driver 
+        df_plot_final = identify_dominant_driver(df_plot_final)
+        
+        # Join S&P 500 data for plotting 
+        df_plot_final = df_plot_final.join(df_raw_universal['SP500'], how='inner')
+
+        # 3. Print summary
+        print("\n--- Model Summary (Plot Period: 2001-Present) ---")
+        print(f"Plot Period: {df_plot_final.index.min().strftime('%Y-%m-%d')} to {df_plot_final.index.max().strftime('%Y-%m-%d')}")
+        print(f"Thresholds based on Full History (1993-Present):")
+        print(f"  Standard Deviation (sigma): {sigma_DL_universal:.2f}")
+        print(f"  Neutral Band Epsilon (+/-): {epsilon_DL_universal:.2f}")
+        print("Regime Counts:")
+        print(df_plot_final['Regime'].value_counts().to_string())
+        
+        print("\n--- Recent Regime History (Regime + Dominant Driver) ---")
+        print(df_plot_final[['Delta_L', 'Regime', 'Driver']].tail(12).to_string())
+
+        # 4. Visualization (TWO SUBPLOTS)
+        
+        # Create two subplots that share the same x-axis (time)
+        fig, (ax_delta_l, ax_sp500) = plt.subplots(2, 1, figsize=(14, 8), 
+                                                sharex=True, 
+                                                gridspec_kw={'height_ratios': [2, 1], 'hspace': 0.05})
+        
+        # --- SUBPLOT 1: Net Liquidity Change Score (Delta L) ---
+        ax = ax_delta_l
+        
+        fill_bottom = df_plot_final['Delta_L'].min() * 1.1
+        fill_top = df_plot_final['Delta_L'].max() * 1.1
+
+        # Background Fill (based on Delta L Regimes)
+        for regime, color in REGIME_COLORS.items():
+            regime_data = df_plot_final[df_plot_final['Regime'] == regime]
+            if not regime_data.empty:
+                ax.fill_between(regime_data.index, fill_bottom, fill_top, facecolor=color, alpha=0.4, label=regime)
+
+        # Plot the Delta_L score
+        ax.plot(df_plot_final.index, df_plot_final['Delta_L'], color='blue', linewidth=2.0, label=r'Net Liquidity Change Score ($\Delta L$)')
+        
+        # Plot the thresholds (Universal Sigma)
+        ax.axhline(sigma_DL_universal, color='black', linestyle='--', linewidth=0.8, label=r'$\pm 1\sigma$ Thresholds')
+        ax.axhline(-sigma_DL_universal, color='black', linestyle='--', linewidth=0.8)
+        ax.axhline(epsilon_DL_universal, color='gray', linestyle=':', linewidth=0.8, label=r'$\pm \epsilon$ Neutral Band') 
+        ax.axhline(-epsilon_DL_universal, color='gray', linestyle=':', linewidth=0.8)
+        ax.axhline(0, color='black', linestyle='-', linewidth=1.0) 
+
+        ax.set_title(f'Fed Policy Regime Model (Universal $\sigma$ from 1993) - Plotting {PLOT_START_DATE}-Present', fontsize=14)
+        ax.set_ylabel('Net Liquidity Change Score (Z-Score Units)', fontsize=10)
+        ax.grid(True, linestyle=':', alpha=0.6)
+        
+        # Set legend on the top plot
+        handles, labels = ax.get_legend_handles_labels()
+        unique_labels = {}
+        for h, l in zip(handles, labels):
+            if l not in unique_labels:
+                unique_labels[l] = h
+        ax.legend(unique_labels.values(), unique_labels.keys(), loc='upper right', title="Liquidity Regimes", fontsize=8)
+
+
+        # --- SUBPLOT 2: S&P 500 Price ---
+        ax2 = ax_sp500
+        
+        # Plot S&P 500 Price
+        ax2.plot(df_plot_final.index, df_plot_final['SP500'], color='red', linewidth=1.5, label='S&P 500 Index Price')
+        
+        ax2.set_xlabel('Date (Monthly)', fontsize=10)
+        ax2.set_ylabel('S&P 500 Price (Index Level)', fontsize=10)
+        ax2.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:,.0f}'))
+        ax2.grid(True, linestyle=':', alpha=0.6)
+        
+        # Add a light fill to mirror the regimes below the liquidity line for correlation
+        sp500_min = df_plot_final['SP500'].min()
+        sp500_max = df_plot_final['SP500'].max()
+        
+        for regime, color in REGIME_COLORS.items():
+            regime_data = df_plot_final[df_plot_final['Regime'] == regime]
+            if not regime_data.empty:
+                # Fill based on the regime classification from the top plot
+                ax2.fill_between(regime_data.index, sp500_min, sp500_max, 
+                                 facecolor=color, alpha=0.1, zorder=0)
+
+        # --- FIX: Replace plt.tight_layout() with manual adjustment ---
+        # This resolves the UserWarning about incompatible axes
+        fig.subplots_adjust(left=0.08, right=0.95, top=0.92, bottom=0.08, hspace=0.1)
+        plt.show()
+
+    except ValueError as e:
+        print(f"\nExecution Failed: {e}")
+    except requests.HTTPError as e:
+        print(f"\nHTTP Error fetching FRED data. Check your API key or series IDs: {e}")
