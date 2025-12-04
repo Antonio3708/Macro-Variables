@@ -1,14 +1,12 @@
-Universal standard deviation 1993 - 2025  / This can be changed 
+Universal standard deviation 1993–2025 / This can be adjusted
 
-This simple model is designed to identify FED policy (Liquidity) regime, and does not replace Chicago Fed National Financial Conditions Index. 
+This simple model is designed to identify the Fed’s policy (liquidity) regime and is not a replacement for the Chicago Fed National Financial Conditions Index.
 
-Formula, in simple 
-Liquidity score = Changes in Fed Policy rates + Changes in Fed balance sheet expansion + Changes in Fed balance long-term bond purchases 
+Simplified formula:
+Liquidity Score = Change in the Fed policy rate + Change in the Fed balance sheet + Change in the Fed’s long-term bond purchases
 
-As it uses universal sigma, this model is not appropriate to identify short-term policy effort by FED. 
-
-There are many limitations to this model. This was actually a beta version to check if code works but somehow it does bare minimum in recognizing each fed policy regime and 
-With 
+This model places emphasis on the Fed’s long-term bond purchase activity, as I believe that buying long-term Treasuries is significantly more effective than buying short-term Treasuries in easing financial conditions.
+Because this model uses a universal sigma, it is not appropriate for identifying short-term policy actions by the Fed. (Model will probably underestimate the size of the operation as 2008 and post covide effort were great)
 
 Chicago Fed National Financial Conditions Index / Highly recommend
 https://fred.stlouisfed.org/series/NFCI
