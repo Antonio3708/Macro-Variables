@@ -1,12 +1,24 @@
+You must gain Fred api key to run it. Anybody can gain the access for free.
+https://fred.stlouisfed.org/docs/api/api_key.html
+
 Universal standard deviation 1993–2025 / This can be adjusted
 
 This simple model is designed to identify the Fed’s policy (liquidity) regime and is not a replacement for the Chicago Fed National Financial Conditions Index.
 
 Simplified formula:
-Liquidity Score = Change in the Fed policy rate + Change in the Fed balance sheet + Change in the Fed’s long-term bond purchases
+Liquidity Score = Change in the Fed policy rate + Change in the Fed balance sheet sie + Change in the Fed’s long-term bond purchases
 
 This model places emphasis on the Fed’s long-term bond purchase activity, as I believe that buying long-term Treasuries is significantly more effective than buying short-term Treasuries in easing financial conditions.
-Because this model uses a universal sigma, it is not appropriate for identifying short-term policy actions by the Fed. (Model will probably underestimate the size of the operation as 2008 and post covide effort were great)
+
+limitations
+- The model only minimally captures the effects of MBS purchases and sales.
+- Because it uses a universal standard deviation, it is not suitable for identifying short-term policy actions by the Fed.(Model will probably underestimate the size of the operation as 2008 and post covide effort were great)
+- The model reflects only changes in policy rates and balance-sheet size; therefore, when the Fed maintains a policy without change, the model fails to capture the ongoing, sustained impact of that policy.
+/// This model is coded to reflect no change as 'Neutral' stance. 
+- Using a standard-deviation framework is not a conventional way to measure Fed policy intensity.
+    In practice, most Fed actions are expressed in basis-point equivalents.
+    For example, $10 billion in long-term Treasury purchases may correspond to roughly 0.45 bps of effective rate cuts.
+
 
 This modle can be used quite effectively when used with...
 
