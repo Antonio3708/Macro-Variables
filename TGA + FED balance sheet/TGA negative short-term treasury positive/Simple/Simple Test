@@ -1,0 +1,413 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from fredapi import Fred
+from pandas.tseries.offsets import BDay 
+from datetime import datetime
+
+# --- 0. Configuration and Data Access ---
+# ⚠️ ACTION REQUIRED: Replace 'YOUR_FRED_API_KEY' with your actual FRED API key
+FRED_API_KEY = '' 
+fred = Fred(api_key=FRED_API_KEY)
+
+# Signal Threshold (in Millions of USD, as reported by FRED)
+FED_SHORT_THRESHOLD = 6_000  # 5 Billion USD
+
+# FRED Series IDs (Weekly, Wednesday Level)
+TGA_ID = 'WDTGAL'        
+FED_SHORTER_ID = 'TREAS911Y' 
+FED_SHORT_NAME = 'FED_91D_1YR' 
+
+# Recession Indicator Series (Monthly)
+RECESSION_ID = 'USREC' 
+
+# Stock Tickers (Daily)
+SPX_TICKER = '^GSPC' 
+NASDAQ_TICKER = '^IXIC' 
+
+# Define the return periods in approximate business days (START_DAY, END_DAY)
+RETURN_PERIODS = {
+    '1st Week': (1, 5),    
+    '2nd Week': (6, 10),   
+    '3rd Week': (11, 15),  
+    '1st Month': (1, 21),  
+    '2nd Month': (22, 42), 
+    '3rd Month': (43, 63)  
+}
+
+# The longest lookahead period (used for data cutoff)
+MAX_LOOKAHEAD_DAYS = max(end for start, end in RETURN_PERIODS.values()) # 63 days
+
+# Define the period to use for the highest/lowest analysis
+ANALYSIS_PERIOD = '1st Month' 
+
+# --- GLOBAL COLUMN NAME DEFINITIONS ---
+SPX_ANALYSIS_COL = f'{SPX_TICKER}_{ANALYSIS_PERIOD.replace(" ", "")}'
+NASDAQ_ANALYSIS_COL = f'{NASDAQ_TICKER}_{ANALYSIS_PERIOD.replace(" ", "")}'
+
+
+# --- 1. Data Acquisition (No Change) ---
+
+def get_data(start_date='2000-01-01'):
+    """Fetches economic, recession, and stock data."""
+    print(f"Fetching FRED data (TGA, {FED_SHORTER_ID}, and {RECESSION_ID}) starting from {start_date}...")
+    
+    tga_data = fred.get_series(TGA_ID, start_date=start_date).rename('TGA')
+    fed_data = fred.get_series(FED_SHORTER_ID, start_date=start_date).rename(FED_SHORT_NAME)
+    
+    recession_data = fred.get_series(RECESSION_ID, start_date=start_date).rename('Recession')
+    recession_data_weekly = recession_data.resample('W-WED').ffill().dropna()
+
+    weekly_data = pd.concat([tga_data, fed_data], axis=1).dropna()
+    
+    weekly_data = weekly_data.merge(
+        recession_data_weekly, 
+        left_index=True, 
+        right_index=True, 
+        how='left'
+    ).ffill().dropna()
+    weekly_data['Recession'] = weekly_data['Recession'].astype(bool)
+
+    print("Fetching Stock Market data (S&P 500 and Nasdaq)...")
+    stock_data_df = yf.download(
+        [SPX_TICKER, NASDAQ_TICKER], 
+        start=start_date,
+        auto_adjust=True, 
+        group_by='ticker' 
+    )
+    
+    stock_data = pd.DataFrame({
+        SPX_TICKER: stock_data_df[SPX_TICKER]['Close'],
+        NASDAQ_TICKER: stock_data_df[NASDAQ_TICKER]['Close']
+    })
+    
+    # Ensure daily returns start after the signal data begins
+    daily_returns = stock_data.pct_change().dropna()
+    
+    return weekly_data, daily_returns
+
+# --- 2. Define Condition & Identify Signal Dates (DYNAMIC CUTOFF) ---
+
+def identify_signal_dates(weekly_data, daily_returns, lookback=1):
+    """
+    Identifies signals and applies a dynamic cutoff to ensure the longest
+    return period can be calculated completely.
+    """
+    
+    weekly_data['TGA_Change'] = weekly_data['TGA'].diff(lookback)
+    weekly_data['FED_SHORT_Change'] = weekly_data[FED_SHORT_NAME].diff(lookback)
+    
+    condition = (weekly_data['TGA_Change'] < 0) & (weekly_data['FED_SHORT_Change'] >= FED_SHORT_THRESHOLD)
+    
+    weekly_data['Signal'] = condition.astype(int)
+    
+    # Only keep the required columns for efficiency and clarity
+    signals_data = weekly_data[weekly_data['Signal'] == 1][[
+        'TGA_Change', 
+        'FED_SHORT_Change', 
+        'Recession'
+    ]].copy()
+    
+    initial_count = len(signals_data)
+
+    # --- DYNAMIC CUTOFF LOGIC ---
+    if not signals_data.empty and not daily_returns.empty:
+        # Find the last date of stock data
+        last_daily_date = daily_returns.index.max().normalize()
+        
+        # Calculate the earliest date a signal must occur by to support the MAX_LOOKAHEAD_DAYS
+        # We look back one more day than the max offset (63) to include the signal day itself.
+        required_start_date = last_daily_date - BDay(MAX_LOOKAHEAD_DAYS + 1)
+        
+        # Filter the signals
+        signals_data = signals_data[signals_data.index <= required_start_date]
+        
+        
+    print(f"Found {initial_count} total historical signal dates meeting the stringent condition.")
+    print(f"Using {len(signals_data)} signals for backtesting (Dynamic cutoff: must predate {required_start_date.strftime('%Y-%m-%d')} for complete {MAX_LOOKAHEAD_DAYS}-day returns).")
+    
+    return signals_data
+
+# --- 3. Backtesting Function (Non-Overlapping Logic - No structural change needed) ---
+
+def backtest_strategy(signals_df, daily_returns, periods):
+    """
+    Calculates returns for defined discrete (start_day, end_day) periods 
+    relative to the signal date.
+    """
+    
+    signal_dates = signals_df.index
+    all_returns = pd.DataFrame(index=signal_dates)
+    daily_index = daily_returns.index
+    
+    for period_name, (start_day_offset, end_day_offset) in periods.items():
+        spx_returns = []
+        nasdaq_returns = []
+
+        spx_col_name = f'{SPX_TICKER}_{period_name.replace(" ", "")}'
+        nasdaq_col_name = f'{NASDAQ_TICKER}_{period_name.replace(" ", "")}'
+
+        for signal_date in signal_dates:
+            try:
+                # Find the actual date corresponding to the start and end offsets
+                # Note: BDay(1) is the next business day. Signal date is Day 0.
+                start_date_target = signal_date + BDay(start_day_offset)
+                end_date_target = signal_date + BDay(end_day_offset)
+                
+                # Find the index locations for slicing
+                start_loc = daily_index.searchsorted(start_date_target)
+                end_loc = daily_index.searchsorted(end_date_target)
+                
+                # Check for incomplete lookback/lookahead data. Since we filtered the signals 
+                # this check should now mostly be for safety, not for filtering.
+                if start_loc >= len(daily_index) or end_loc >= len(daily_index) or start_loc >= end_loc:
+                    spx_returns.append(np.nan)
+                    nasdaq_returns.append(np.nan)
+                    continue
+
+                # Ensure slicing is done on the correct dates
+                slice_start_date = daily_index[start_loc]
+                slice_end_date = daily_index[end_loc]
+
+                # Cumulative return calculation: (1 + r1) * (1 + r2) * ... - 1
+                spx_cum_return = (daily_returns[SPX_TICKER].loc[slice_start_date:slice_end_date] + 1).prod() - 1
+                nasdaq_cum_return = (daily_returns[NASDAQ_TICKER].loc[slice_start_date:slice_end_date] + 1).prod() - 1
+
+                spx_returns.append(spx_cum_return)
+                nasdaq_returns.append(nasdaq_cum_return)
+            
+            except Exception:
+                spx_returns.append(np.nan)
+                nasdaq_returns.append(np.nan)
+                continue
+        
+        # Store individual returns
+        all_returns[spx_col_name] = pd.Series(spx_returns, index=signal_dates, dtype=float)
+        all_returns[nasdaq_col_name] = pd.Series(nasdaq_returns, index=signal_dates, dtype=float)
+
+    # Use pd.concat for robust combining of returns and signals
+    detailed_returns = pd.concat([signals_df, all_returns], axis=1)
+    
+    return detailed_returns
+
+# --- 4. Main Execution Block ---
+
+def format_summary(df_detailed, is_recession, title):
+    """Calculates and formats summary results based on the recession status."""
+    
+    # Filter the detailed results internally
+    df_filtered = df_detailed[df_detailed['Recession'] == is_recession].copy()
+    
+    # --- EXTREME COLUMN RETENTION LOGIC ---
+    return_cols = [
+        f'{t}_{p.replace(" ", "")}' 
+        for p in RETURN_PERIODS 
+        for t in [SPX_TICKER, NASDAQ_TICKER]
+    ]
+    for col in return_cols:
+        if col in df_detailed.columns and col not in df_filtered.columns:
+            df_filtered[col] = df_detailed[col].reindex(df_filtered.index)
+    # --------------------------------------
+    
+    df = df_filtered
+    summary = []
+    
+    if df.empty:
+        print("\n" + "="*80)
+        print(f"### 📈 Backtest Results: {title} ###")
+        print(r"TGA $\downarrow$ & FED 91D-1YR $\uparrow$ ($\ge$ $3B$)")
+        print("="*80)
+        print("No historical signals matched this condition.")
+        return df
+        
+    print("\n" + "="*80)
+    print(f"### 📈 Backtest Results: {title} ###")
+    print(r"TGA $\downarrow$ & FED 91D-1YR $\uparrow$ ($\ge$ $3B$)")
+    print("="*80)
+    
+    # Prepare column names for the diagnostic print
+    first_period_key = list(RETURN_PERIODS.keys())[0]
+    spx_col_first = f'{SPX_TICKER}_{first_period_key.replace(" ", "")}'
+    
+    for period_name in RETURN_PERIODS.keys():
+        col_key = period_name.replace(" ", "")
+        spx_col = f'{SPX_TICKER}_{col_key}'
+        nasdaq_col = f'{NASDAQ_TICKER}_{col_key}'
+        
+        # Check column existence robustly
+        if spx_col not in df.columns:
+             continue
+        
+        # This .dropna() is the real filter for incomplete data
+        spx_returns = df[spx_col].dropna()
+        nasdaq_returns = df[nasdaq_col].dropna()
+        
+        count = len(spx_returns) 
+        
+        if spx_returns.empty:
+            spx_avg, spx_win_rate, nasdaq_avg, nasdaq_win_rate = np.nan, np.nan, np.nan, np.nan
+        else:
+            spx_avg = np.mean(spx_returns)
+            spx_win_rate = np.mean(spx_returns > 0) * 100
+            nasdaq_avg = np.mean(nasdaq_returns)
+            nasdaq_win_rate = np.mean(nasdaq_returns > 0) * 100
+        
+        summary.append({
+            'Period': period_name,
+            'N Signals (Complete)': count,
+            f'{SPX_TICKER} Avg Return': f"{spx_avg:.2%}" if not np.isnan(spx_avg) else 'N/A',
+            f'{SPX_TICKER} Win Rate': f"{spx_win_rate:.2f}%" if not np.isnan(spx_win_rate) else 'N/A',
+            f'{NASDAQ_TICKER} Avg Return': f"{nasdaq_avg:.2%}" if not np.isnan(nasdaq_avg) else 'N/A',
+            f'{NASDAQ_TICKER} Win Rate': f"{nasdaq_win_rate:.2f}%" if not np.isnan(nasdaq_win_rate) else 'N/A'
+        })
+            
+    summary_df = pd.DataFrame(summary)
+    
+    if summary_df.empty or summary_df['N Signals (Complete)'].sum() == 0:
+        print("No valid return data found for any period in this segment.")
+        
+        # --- CRITICAL DIAGNOSTIC PRINT ---
+        print("\n**DIAGNOSTIC:** Raw filtered data (First 5 rows with NaNs):")
+        cols_to_print = ['TGA_Change', 'Recession']
+        
+        if spx_col_first in df.columns: 
+             cols_to_print.append(spx_col_first)
+             cols_to_print.append(spx_col_first.replace(SPX_TICKER, NASDAQ_TICKER))
+            
+        if not df.empty and len(cols_to_print) > 2:
+             print(df.head()[cols_to_print].to_markdown())
+        # -----------------------------------
+        
+    else:
+        print(summary_df.to_markdown(index=False))
+        
+    return df
+
+def analyze_extremes(analysis_df, period_name, ticker, title):
+    """Prints the top 5 highest and lowest return cases for a given period/ticker."""
+    
+    # Recalculate column names based on the new convention
+    col_name_key = period_name.replace(" ", "")
+    col_name = f'{ticker}_{col_name_key}'
+    
+    if col_name not in analysis_df.columns:
+        print(f"\n--- Analysis Skipped for {title} (Column {col_name} missing from final DataFrame) ---")
+        return
+        
+    # Filter for the relevant returns (removes the NaNs/incomplete data)
+    filtered_df = analysis_df.dropna(subset=[col_name]).copy() 
+
+    if filtered_df.empty:
+        print(f"\n--- Analysis Skipped for {title} (No complete {period_name} data after filtering) ---")
+        return
+        
+    # Prepare the analysis DataFrame: Calculate change values for display (in Billions)
+    filtered_df['TGA_Change_B'] = (filtered_df['TGA_Change'] / 1e3).round(1)
+    filtered_df['FED_Short_Change_B'] = (filtered_df['FED_SHORT_Change'] / 1e3).round(1)
+    
+    
+    # --- Highest Returns ---
+    top_5 = filtered_df.nlargest(5, col_name)
+    
+    print(f"\n### 🏆 Top 5 Highest {period_name} Returns for {ticker} ({title}) ###")
+    top_5_display = top_5[['TGA_Change_B', 'FED_Short_Change_B', col_name]].copy()
+    top_5_display.index.name = 'Wednesday Signal Date'
+    top_5_display['TGA_Change_B'] = top_5_display['TGA_Change_B'].map('{:,.1f}B'.format)
+    top_5_display['FED_Short_Change_B'] = top_5_display['FED_Short_Change_B'].map('+{:,.1f}B'.format)
+    top_5_display[col_name] = top_5_display[col_name].map('{:,.2%}'.format)
+    top_5_display.rename(columns={'TGA_Change_B': 'TGA Change', 'FED_Short_Change_B': 'FED Change', col_name: 'Return'}, inplace=True)
+    print(top_5_display.to_markdown())
+
+    # --- Lowest Returns ---
+    bottom_5 = filtered_df.nsmallest(5, col_name)
+    
+    print(f"\n### 📉 Top 5 Lowest {period_name} Returns for {ticker} ({title}) ###")
+    bottom_5_display = bottom_5[['TGA_Change_B', 'FED_Short_Change_B', col_name]].copy()
+    bottom_5_display.index.name = 'Wednesday Signal Date'
+    bottom_5_display['TGA_Change_B'] = bottom_5_display['TGA_Change_B'].map('{:,.1f}B'.format)
+    bottom_5_display['FED_Short_Change_B'] = bottom_5_display['FED_Short_Change_B'].map('+{:,.1f}B'.format)
+    bottom_5_display[col_name] = bottom_5_display[col_name].map('{:,.2%}'.format)
+    bottom_5_display.rename(columns={'TGA_Change_B': 'TGA Change', 'FED_Short_Change_B': 'FED Change', col_name: 'Return'}, inplace=True)
+    print(bottom_5_display.to_markdown())
+
+
+def main():
+    try:
+        # Step 1: Get Data
+        weekly_data, daily_returns = get_data() 
+
+        # Step 2: Identify Signals and process ALL signals at once
+        # Pass daily_returns to identify_signal_dates for the dynamic cutoff
+        signals_data = identify_signal_dates(weekly_data, daily_returns)
+        
+        if signals_data.empty:
+            print(f"\nNo periods found matching the TGA down and FED 91 Days to 1 YR up condition (>= ${FED_SHORT_THRESHOLD * 1000000:,} threshold).")
+            return
+
+        # Step 3: Backtest ALL periods and merge into one large DataFrame
+        returns_detailed = backtest_strategy(signals_data, daily_returns, RETURN_PERIODS)
+        
+        # --- Step 3a: Print Non-Recession Summary ---
+        returns_non_recession = format_summary(returns_detailed, False, "NON-RECESSION PERIODS")
+        
+        # --- Step 3b: Print Recession Summary ---
+        returns_recession = format_summary(returns_detailed, True, "RECESSION PERIODS (NBER Defined)")
+
+        
+        # --- Step 4: Top/Bottom Analysis (using the specific ANALYSIS_PERIOD) ---
+        print("\n" + "="*80)
+        print(f"### 🎯 Extreme Signal Analysis ({ANALYSIS_PERIOD} Returns) ###")
+        print("="*80)
+        
+        # Non-Recession Extremes
+        analyze_extremes(returns_non_recession, ANALYSIS_PERIOD, SPX_TICKER, "Non-Recession SPX")
+        analyze_extremes(returns_non_recession, ANALYSIS_PERIOD, NASDAQ_TICKER, "Non-Recession NASDAQ")
+
+        # Recession Extremes
+        analyze_extremes(returns_recession, ANALYSIS_PERIOD, SPX_TICKER, "Recession SPX")
+        analyze_extremes(returns_recession, ANALYSIS_PERIOD, NASDAQ_TICKER, "Recession NASDAQ")
+
+
+        # --- Step 5: List Latest Incidents (All combined) ---
+        print("\n" + "="*80)
+        print(r"### 📅 Latest 20 Incidents: TGA $\downarrow$ & FED 91D-1YR $\uparrow$ ($\ge$ $3B$) (FULL SET) ###")
+        print("Recession status is indicated (True/False).")
+        print("NOTE: Returns cannot be reliably computed for signals after the dynamic cutoff date.")
+        print("="*80)
+        
+        # Get ORIGINAL, non-truncated signals data for the list
+        weekly_data, daily_returns = get_data() 
+        weekly_data['TGA_Change'] = weekly_data['TGA'].diff(1)
+        weekly_data['FED_SHORT_Change'] = weekly_data[FED_SHORT_NAME].diff(1)
+        condition = (weekly_data['TGA_Change'] < 0) & (weekly_data['FED_SHORT_Change'] >= FED_SHORT_THRESHOLD)
+        original_signals_data = weekly_data[condition][['TGA_Change', 'FED_SHORT_Change', 'Recession']].copy()
+        
+        signals_df = original_signals_data.sort_index(ascending=False).head(20)
+
+        latest_incidents = signals_df[[
+            'TGA_Change', 
+            'FED_SHORT_Change', 
+            'Recession'
+        ]].copy()
+        
+        # Formatting for readability in Billions
+        latest_incidents.index.name = 'Wednesday Signal Date'
+        
+        # TGA formatting
+        latest_incidents['TGA_Change'] = (latest_incidents['TGA_Change'] / 1e3).round(1).map('${:,.1f} B'.format)
+        latest_incidents['TGA_Change'] = latest_incidents['TGA_Change'].apply(lambda x: x if x.startswith('-') else '-' + x)
+        
+        # FED formatting
+        latest_incidents['FED_SHORT_Change'] = (latest_incidents['FED_SHORT_Change'] / 1e3).round(1).map('+${:,.1f} B'.format)
+        
+        print(latest_incidents.to_markdown())
+
+
+    except Exception as e:
+        # Catch any unexpected error and print context
+        print(f"\nAn UNEXPECTED fatal error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == '__main__':
+    main()
