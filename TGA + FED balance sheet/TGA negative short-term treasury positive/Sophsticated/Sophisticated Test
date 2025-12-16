@@ -1,0 +1,400 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from fredapi import Fred
+from pandas.tseries.offsets import BDay 
+import requests
+from datetime import datetime
+
+# ----------------------------------------------------------------------
+# I. CONFIGURATION
+# ----------------------------------------------------------------------
+
+# **REPLACE WITH YOUR ACTUAL FRED API KEY**
+FRED_API_KEY = "" 
+fred = Fred(api_key=FRED_API_KEY)
+
+# --- A. TGA/FED Signal Config ---
+FED_SHORT_THRESHOLD = 5_000  # 3 Billion USD
+TGA_ID = 'WDTGAL'        
+FED_SHORTER_ID = 'TREAS911Y' 
+FED_SHORT_NAME = 'FED_91D_1YR' 
+RECESSION_ID = 'USREC' 
+SPX_TICKER = '^GSPC' 
+NASDAQ_TICKER = '^IXIC' 
+
+# Define the return periods in approximate business days (START_DAY, END_DAY)
+RETURN_PERIODS = {
+    '1st Week': (1, 5),    
+    '2nd Week': (6, 10),   
+    '3rd Week': (11, 15),  
+    '1st Month': (1, 21),  
+    '2nd Month': (22, 42), 
+    '3rd Month': (43, 63)  
+}
+MAX_LOOKAHEAD_DAYS = max(end for start, end in RETURN_PERIODS.values()) # 63 days
+ANALYSIS_PERIOD = '1st Month' 
+
+
+# --- B. Liquidity Model Config ---
+LIQUIDITY_START_DATE = '1993-01-01' # Universal Sigma Calculation Start
+FRED_SERIES_LIQ = {
+    'DFF': 'DFF',        
+    'WALCL': 'WALCL',    
+    'TREAS10Y': 'TREAS10Y', 
+    'TREAS1T5': 'TREAS1T5' 
+}
+WEIGHTS = {
+    'R': -3.0,       
+    'BS_Size': 2.5,  
+    'BS_Duration': 2.0 
+}
+NEUTRAL_EPSILON_FACTOR = 0.05 # For Neutral Band definition
+
+
+# ----------------------------------------------------------------------
+# II. LIQUIDITY MODEL FUNCTIONS 
+# ----------------------------------------------------------------------
+
+def fetch_fred_data_liq(series_id, api_key, start_date):
+    """Fetches data for a single FRED series."""
+    url = f"https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        'series_id': series_id,
+        'api_key': api_key,
+        'file_type': 'json',
+        'observation_start': start_date,
+        'sort_order': 'asc'
+    }
+    response = requests.get(url, params=params)
+    response.raise_for_status() 
+    
+    data = response.json().get('observations', [])
+    df = pd.DataFrame(data)[['date', 'value']]
+    df['value'] = pd.to_numeric(df['value'], errors='coerce') 
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date').dropna()
+    return df
+
+def calculate_monthly_delta_l(api_key, start_date, series_config, weights, epsilon_factor):
+    """Calculates the final Delta_L and its Regime for the entire period."""
+    
+    data = {}
+    for key, series_id in series_config.items():
+        df = fetch_fred_data_liq(series_id, api_key, start_date) 
+        
+        # DFF uses mean, others (WALCL, TREAS) use the last value of the month
+        if key in ['DFF']:
+            data[key] = df['value'].resample('ME').mean()
+        else:
+            data[key] = df['value'].resample('ME').last() 
+            
+    df_raw = pd.DataFrame(data).dropna()
+
+    # --- 1. Calculate Unnormalized Changes ---
+    df_delta = pd.DataFrame(index=df_raw.index)
+    df_delta['dDFF'] = df_raw['DFF'].diff()
+    df_delta['dWALCL'] = df_raw['WALCL'].diff()
+    df_delta['BS_Ratio'] = df_raw['TREAS10Y'] / df_raw['TREAS1T5']
+    df_delta['dBS_Duration'] = df_delta['BS_Ratio'].diff()
+    df_delta = df_delta.dropna()
+
+    # --- 2. Calculate Universal Sigma (Normalization) ---
+    stds = df_delta[['dDFF', 'dWALCL', 'dBS_Duration']].std()
+        
+    # --- 3. Calculate Final Normalized Delta_L ---
+    df_final = pd.DataFrame(index=df_delta.index)
+    df_final['Comp_R'] = weights['R'] * (df_delta['dDFF'] / stds['dDFF'])
+    df_final['Comp_BS_Size'] = weights['BS_Size'] * (df_delta['dWALCL'] / stds['dWALCL'])
+    df_final['Comp_BS_Duration'] = weights['BS_Duration'] * (df_delta['dBS_Duration'] / stds['dBS_Duration'])
+    
+    df_final['Delta_L'] = (df_final['Comp_R'] + df_final['Comp_BS_Size'] + df_final['Comp_BS_Duration'])
+
+    # --- 4. Classify Regime ---
+    sigma_DL_universal = df_final['Delta_L'].std()
+    epsilon_DL_universal = epsilon_factor * sigma_DL_universal
+    
+    # Classify the three core zones: Expansion, Contraction, Neutral
+    df_final['IsNeutral'] = (df_final['Delta_L'].abs() <= epsilon_DL_universal)
+    df_final['IsExpansion'] = (df_final['Delta_L'] > epsilon_DL_universal)
+    df_final['IsContraction'] = (df_final['Delta_L'] < -epsilon_DL_universal)
+    
+    # Calculate Previous Delta L for Neutral Transition logic
+    df_final['Delta_L_Prev'] = df_final['Delta_L'].shift(1)
+    
+    print(f"Liquidity Model Calculated. Sigma: {sigma_DL_universal:.2f}. Neutral Band: +/-{epsilon_DL_universal:.2f}")
+
+    return df_final[['Delta_L', 'IsNeutral', 'IsExpansion', 'IsContraction', 'Delta_L_Prev']]
+
+
+# ----------------------------------------------------------------------
+# III. TGA/FED SIGNAL FUNCTIONS 
+# ----------------------------------------------------------------------
+
+def get_tga_data(start_date='2000-01-01'):
+    """Fetches economic, recession, and stock data."""
+    print(f"Fetching TGA/FED data starting from {start_date}...")
+    
+    tga_data = fred.get_series(TGA_ID, start_date=start_date).rename('TGA')
+    fed_data = fred.get_series(FED_SHORTER_ID, start_date=start_date).rename(FED_SHORT_NAME)
+    
+    recession_data = fred.get_series(RECESSION_ID, start_date=start_date).rename('Recession')
+    recession_data_weekly = recession_data.resample('W-WED').ffill().dropna()
+
+    weekly_data = pd.concat([tga_data, fed_data], axis=1).dropna()
+    
+    weekly_data = weekly_data.merge(
+        recession_data_weekly, 
+        left_index=True, 
+        right_index=True, 
+        how='left'
+    ).ffill().dropna()
+    weekly_data['Recession'] = weekly_data['Recession'].astype(bool)
+
+    print("Fetching Stock Market data...")
+    stock_data_df = yf.download(
+        [SPX_TICKER, NASDAQ_TICKER], 
+        start=start_date,
+        auto_adjust=True, 
+        group_by='ticker' 
+    )
+    
+    stock_data = pd.DataFrame({
+        SPX_TICKER: stock_data_df[SPX_TICKER]['Close'],
+        NASDAQ_TICKER: stock_data_df[NASDAQ_TICKER]['Close']
+    })
+    
+    daily_returns = stock_data.pct_change().dropna()
+    
+    return weekly_data, daily_returns
+
+def identify_signal_dates(weekly_data, daily_returns, lookback=1):
+    """
+    Identifies TGA/FED signals and applies a dynamic cutoff based on max lookahead.
+    """
+    
+    weekly_data['TGA_Change'] = weekly_data['TGA'].diff(lookback)
+    weekly_data['FED_SHORT_Change'] = weekly_data[FED_SHORT_NAME].diff(lookback)
+    
+    condition = (weekly_data['TGA_Change'] < 0) & (weekly_data['FED_SHORT_Change'] >= FED_SHORT_THRESHOLD)
+    
+    signals_data = weekly_data[condition][[
+        'TGA_Change', 
+        'FED_SHORT_Change', 
+        'Recession'
+    ]].copy()
+    
+    initial_count = len(signals_data)
+
+    # --- DYNAMIC CUTOFF LOGIC ---
+    if not signals_data.empty and not daily_returns.empty:
+        last_daily_date = daily_returns.index.max().normalize()
+        # Ensure enough time for the longest lookahead period (3 Months / 63 days)
+        required_start_date = last_daily_date - BDay(MAX_LOOKAHEAD_DAYS + 1)
+        signals_data = signals_data[signals_data.index <= required_start_date]
+        
+    print(f"Found {initial_count} total historical signals. Using {len(signals_data)} for backtesting.")
+    
+    return signals_data
+
+def backtest_strategy(signals_df, daily_returns, periods):
+    """Calculates forward returns for all signals and periods."""
+    
+    signal_dates = signals_df.index
+    all_returns = pd.DataFrame(index=signal_dates)
+    daily_index = daily_returns.index
+    
+    for period_name, (start_day_offset, end_day_offset) in periods.items():
+        spx_returns = []
+        nasdaq_returns = []
+
+        spx_col_name = f'{SPX_TICKER}_{period_name.replace(" ", "")}'
+        nasdaq_col_name = f'{NASDAQ_TICKER}_{period_name.replace(" ", "")}'
+
+        for signal_date in signal_dates:
+            try:
+                start_date_target = signal_date + BDay(start_day_offset)
+                end_date_target = signal_date + BDay(end_day_offset)
+                
+                start_loc = daily_index.searchsorted(start_date_target)
+                end_loc = daily_index.searchsorted(end_date_target)
+                
+                if start_loc >= len(daily_index) or end_loc >= len(daily_index) or start_loc >= end_loc:
+                    spx_returns.append(np.nan)
+                    nasdaq_returns.append(np.nan)
+                    continue
+
+                slice_start_date = daily_index[start_loc]
+                slice_end_date = daily_index[end_loc]
+
+                # Cumulative return calculation: (1 + r1) * (1 + r2) * ... - 1
+                spx_cum_return = (daily_returns[SPX_TICKER].loc[slice_start_date:slice_end_date] + 1).prod() - 1
+                nasdaq_cum_return = (daily_returns[NASDAQ_TICKER].loc[slice_start_date:slice_end_date] + 1).prod() - 1
+
+                spx_returns.append(spx_cum_return)
+                nasdaq_returns.append(nasdaq_cum_return)
+            
+            except Exception:
+                spx_returns.append(np.nan)
+                nasdaq_returns.append(np.nan)
+                continue
+        
+        all_returns[spx_col_name] = pd.Series(spx_returns, index=signal_dates, dtype=float)
+        all_returns[nasdaq_col_name] = pd.Series(nasdaq_returns, index=signal_dates, dtype=float)
+
+    detailed_returns = pd.concat([signals_df, all_returns], axis=1)
+    return detailed_returns
+
+# ----------------------------------------------------------------------
+# IV. CONDITIONAL SUMMARY AND EXECUTION
+# ----------------------------------------------------------------------
+
+def run_conditional_summary(df_combined, filter_condition, title):
+    """
+    Runs the summary for a given Pandas boolean filter applied to df_combined.
+    """
+    
+    df_filtered = df_combined[filter_condition].copy()
+    
+    print("\n" + "="*80)
+    print(f"### 📈 Backtest Results: {title} ###")
+    print(r"TGA $\downarrow$ & FED 91D-1YR $\uparrow$ ($\ge$ $3B$)")
+    print("="*80)
+    
+    if df_filtered.empty:
+        print("No historical signals matched this highly specific condition.")
+        return
+
+    summary = []
+    
+    for period_name in RETURN_PERIODS.keys():
+        col_key = period_name.replace(" ", "")
+        spx_col = f'{SPX_TICKER}_{col_key}'
+        nasdaq_col = f'{NASDAQ_TICKER}_{col_key}'
+        
+        if spx_col not in df_filtered.columns: continue
+        
+        # Calculate statistics only for complete signals (not NaNs due to incomplete lookahead)
+        spx_returns = df_filtered[spx_col].dropna()
+        nasdaq_returns = df_filtered[nasdaq_col].dropna()
+        
+        count = len(spx_returns) 
+        
+        if spx_returns.empty:
+            spx_avg, spx_win_rate, nasdaq_avg, nasdaq_win_rate = np.nan, np.nan, np.nan, np.nan
+        else:
+            spx_avg = np.mean(spx_returns)
+            spx_win_rate = np.mean(spx_returns > 0) * 100
+            nasdaq_avg = np.mean(nasdaq_returns)
+            nasdaq_win_rate = np.mean(nasdaq_returns > 0) * 100
+        
+        summary.append({
+            'Period': period_name,
+            'N Signals (Complete)': count,
+            f'{SPX_TICKER} Avg Return': f"{spx_avg:.2%}" if not np.isnan(spx_avg) else 'N/A',
+            f'{SPX_TICKER} Win Rate': f"{spx_win_rate:.2f}%" if not np.isnan(spx_win_rate) else 'N/A',
+            f'{NASDAQ_TICKER} Avg Return': f"{nasdaq_avg:.2%}" if not np.isnan(nasdaq_avg) else 'N/A',
+            f'{NASDAQ_TICKER} Win Rate': f"{nasdaq_win_rate:.2f}%" if not np.isnan(nasdaq_win_rate) else 'N/A'
+        })
+            
+    summary_df = pd.DataFrame(summary)
+    
+    if summary_df.empty or summary_df['N Signals (Complete)'].sum() == 0:
+        print("No valid return data found for any period in this segment.")
+    else:
+        print(summary_df.to_markdown(index=False))
+
+
+def main():
+    try:
+        # Step 1: Calculate Liquidity Model (Monthly)
+        print("--- 1. CALCULATING MONTHLY LIQUIDITY MODEL ---")
+        df_liquidity = calculate_monthly_delta_l(
+            FRED_API_KEY, 
+            LIQUIDITY_START_DATE, 
+            FRED_SERIES_LIQ, 
+            WEIGHTS, 
+            NEUTRAL_EPSILON_FACTOR
+        )
+        
+        # Step 2: Calculate TGA/FED Signals (Weekly)
+        print("\n--- 2. CALCULATING WEEKLY TGA/FED SIGNALS ---")
+        weekly_data, daily_returns = get_tga_data(start_date='2005-01-01')
+        signals_data = identify_signal_dates(weekly_data, daily_returns)
+        
+        if signals_data.empty:
+            print("\nNo historical TGA/FED signals found after data cutoff.")
+            return
+
+        # Step 3: Backtest Raw Returns
+        returns_detailed = backtest_strategy(signals_data, daily_returns, RETURN_PERIODS)
+        
+        # Step 4: Align Monthly Liquidity Score to Weekly Signal Dates
+        df_liquidity_weekly = df_liquidity.resample('W-WED').ffill()
+        df_combined = returns_detailed.join(df_liquidity_weekly, how='inner').dropna(subset=['Delta_L', 'Delta_L_Prev'])
+        
+        total_signals_filtered = len(df_combined)
+        print(f"\nSuccessfully combined {total_signals_filtered} complete signals with Liquidity scores.")
+        
+        # --- Step 5: Conditional Backtesting ---
+
+        # 5.1. LIQUIDITY EXPANSION (Liquidity Score > Epsilon, Non-Recession)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['IsExpansion'] == True) & (df_combined['Recession'] == False), 
+            "NON-RECESSION & LIQUIDITY EXPANSION ($\Delta L > \epsilon$)"
+        )
+        
+        # 5.2. LIQUIDITY CONTRACTION (Liquidity Score < -Epsilon, Non-Recession)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['IsContraction'] == True) & (df_combined['Recession'] == False), 
+            "NON-RECESSION & LIQUIDITY CONTRACTION ($\Delta L < -\epsilon$)"
+        )
+        
+        # 5.3. NEUTRAL, EXPANDING TRANSITION (Neutral now, previous score > 0, Non-Recession)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['IsNeutral'] == True) & (df_combined['Delta_L_Prev'] > 0) & (df_combined['Recession'] == False), 
+            "NON-RECESSION & NEUTRAL LIQUIDITY (TRANSITION FROM EXPANSION)"
+        )
+
+        # 5.4. NEUTRAL, CONTRACTION TRANSITION (Neutral now, previous score < 0, Non-Recession)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['IsNeutral'] == True) & (df_combined['Delta_L_Prev'] < 0) & (df_combined['Recession'] == False), 
+            "NON-RECESSION & NEUTRAL LIQUIDITY (TRANSITION FROM CONTRACTION)"
+        )
+
+        # --- REVISED RECESSION SCENARIOS (Relaxed Thresholds: Delta L > 0 or Delta L < 0) ---
+        
+        # 5.5. RECESSION & LIQUIDITY EXPANSION (RELAXED: Delta L > 0)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['Delta_L'] > 0) & (df_combined['Recession'] == True), 
+            "RECESSION & LIQUIDITY EXPANSION (RELAXED: $\Delta L > 0$)"
+        )
+
+        # 5.6. RECESSION & LIQUIDITY CONTRACTION (RELAXED: Delta L < 0)
+        run_conditional_summary(
+            df_combined, 
+            (df_combined['Delta_L'] < 0) & (df_combined['Recession'] == True), 
+            "RECESSION & LIQUIDITY CONTRACTION (RELAXED: $\Delta L < 0$)"
+        )
+        
+        print("\n--- Conditional Backtest Complete ---")
+        
+        recession_signals_count = len(df_combined[df_combined['Recession'] == True])
+        print(f"\nTotal TGA/FED signals that occurred during a Recession (NBER Defined): {recession_signals_count}")
+
+    except ValueError as e:
+        print(f"\nExecution Failed: {e}")
+    except requests.HTTPError as e:
+        print(f"\nHTTP Error fetching FRED data. Check your API key or series IDs: {e}")
+    except Exception as e:
+        print(f"\nAn UNEXPECTED fatal error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == '__main__':
+    main()
