@@ -1,0 +1,48 @@
+In my previous analysis, I anticipated that a relatively large amount of liquidity would move from financial markets into the real economy in the United States. 
+I also mentioned that the amount of available liquidity is scarce relative to the size of the debt that must be rolled over this year.
+
+To provide more detail, I have updated the model referenced on GitHub:
+https://github.com/Antonio3708/Macro-Variables/blob/main/Auction%20size%20%26%20Net%20Liquidity/us%20debt%20and%20liquidity%20ratio.ipynb
+
+There are two major findings to highlight:
+  1. The 2026 net bond issuance–to–net liquidity ratio is now the third highest in 26 years. It currently stands at 4.6.
+  2. The 2026 short-term bond issuance–to–net liquidity ratio is the highest in 26 years and has surpassed the 2008 level.
+
+While the net bond issuance / net liquidity ratio is alleviated, the net amount that will be locked in to long-term bonds - the amount that won't be available for the financial market unless the government spends - will remain relatively similar to the last year’s level - 11 trillion. 
+The U.S. Department of the Treasury plans to issue more short-term bonds this year. As a result, the money velocity required to sustain healthy market plumbing is higher than ever.
+In simple terms, the number of times money must circulate between financial markets and the bond market is approaching historical highs, making the system more vulnerable to plumbing stress.
+
+As noted in my previous analysis, there are two primary solutions:
+  A. Increase money velocity (through deregulation and related measures)
+  B. Central bank purchases of government bonds (i.e., financial repression or balance sheet expansion)
+
+Currently, the ongoing Reserve Management Purchases program injects liquidity into the system by purchasing $40 billion worth of short-term Treasuries each month.
+In addition, the United States is preparing to ease banking regulations through the enhanced Supplementary Leverage Ratio (eSLR), which targets money velocity. 
+Under the proposed rule, the eight major banks would benefit from the eased requirements.
+Based on my calculations, the major banks would gain approximately $244 billion in additional balance sheet capacity. 
+Wells Fargo and Bank of America appear to benefit the most among the eight large banks.
+
+
+
+Despite these efforts to boost money velocity and inject liquidity, the system remains in a stress-prone environment with many unknown variables. 
+At least in 2026, I believe the likelihood of quantitative tightening (QT) is low. 
+
+In a previous note on repo market stress, I mentioned that a total reserves–to–nominal GDP ratio below 11% has historically coincided with short-term funding stress. We are currently below 9%.
+It is reasonable to assume that deregulation, dealer’s enlarged balance sheet capacity and faster money velocity could lower the ample-reserves floor (for example, from 11% to 8–9%). 
+
+However, two key data points are still missing:
+- Banks’ willingness to expand repo market participation after eSLR
+- The shape of the reserve demand curve (precautionary demand)
+
+If banks’ demand for reserves remains elevated despite eSLR — due to other regulatory constraints — the policy may not effectively lower the ample-reserves floor. 
+In the absence of this evidence, initiating QT on the assumption that the floor has shifted could be risky.
+
+Overall, the system remains prone to plumbing stress (reserves-to-GDP below 11% combined with the highest short-term issuance-to-liquidity ratio in 26 years), and the effectiveness of the proposed solutions has yet to be demonstrated. 
+The most prudent course of action would be to wait and observe how much efficiency eSLR brings to the short-term funding market, absent any urgent need for QT — which I do not currently see.
+
+
+That said, support for QT is gaining some momentum among certain Federal Reserve officials following the nomination of Kevin Warsh. 
+As a result, there is some risk of a policy pivot in the Reserve Management Purchases program. The Federal Reserve could slow the pace of purchases or eventually wind the program down.
+If balance sheet reduction becomes the Federal Reserve’s primary objective this year, further deregulation beyond eSLR should ideally precede QT. 
+In an optimal scenario, the regulatory relief would offset the liquidity impact of QT to preserve short-term funding stability. However, this outcome appears unlikely in 2026.
+
