@@ -29,6 +29,8 @@ As I believed that the potential for war was low, I excluded the possibility of 
 
 Of course, the Korean market bounced strongly soon afterward, and one of my biggest positions, Micron, also had a great run.
 
+![sold position](1000066957.jpg)
+
 After the run, there was a change in my portfolio. 
 To get straight to the point, I sold my Micron position. 
 I did not share this change for a couple of reasons. 
